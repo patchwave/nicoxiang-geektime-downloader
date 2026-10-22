@@ -16,7 +16,6 @@ import (
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/device"
 
@@ -74,9 +73,12 @@ func PrintArticlePageToPDF(parentCtx context.Context,
 	listenerCtx, listenerCtxCancel := context.WithCancel(timeoutCtx)
 	defer listenerCtxCancel()
 
-	listener := func(ev interface{}) {
-		switch responseReceivedEvent := ev.(type) {
-		case *network.EventResponseReceived:
+	responseReceivedEvents := chromedp.Events(listenerCtx, network.ResponseReceived)
+	go func() {
+		for responseReceivedEvent, err := range responseReceivedEvents {
+			if err != nil {
+				return
+			}
 			response := responseReceivedEvent.Response
 			// rate limit detection
 			if response.URL == geektime.DefaultBaseURL+"/serv/v1/article" && response.Status == 451 {
@@ -97,11 +99,10 @@ func PrintArticlePageToPDF(parentCtx context.Context,
 				}
 			}
 		}
-	}
-	chromedp.ListenTarget(listenerCtx, listener)
+	}()
 
-	tasks := chromedp.Tasks{
-		network.Enable(),
+	tasks := []chromedp.Action[chromedp.Void]{
+		enableNetwork(),
 		chromedp.Emulate(device.IPadPro11),
 		setCookies(cookies),
 		chromedp.Navigate(geektime.DefaultBaseURL + `/column/article/` + strconv.Itoa(aid)),
@@ -119,7 +120,7 @@ func PrintArticlePageToPDF(parentCtx context.Context,
 
 	logger.Infof("Begin download article pdf, articleID: %d, pdfFileName: %s", aid, pdfFileName)
 
-	err := chromedp.Run(timeoutCtx, tasks)
+	err := chromedp.Do(timeoutCtx, tasks...)
 	if err != nil {
 		if rateLimit {
 			logger.Warnf("Hit GeekTime rate limit when downloading article pdf, articleID: %d, pdfFileName: %s", aid, pdfFileName)
@@ -132,12 +133,25 @@ func PrintArticlePageToPDF(parentCtx context.Context,
 	return nil
 }
 
-func setCookies(cookies []*http.Cookie) chromedp.ActionFunc {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		expr := cdp.TimeSinceEpoch(time.Now().Add(180 * 24 * time.Hour))
+func enableNetwork() chromedp.Action[chromedp.Void] {
+	return chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+		_, err := cdp.Call(ctx, t, network.Enable, network.EnableParams{})
+		return err
+	})
+}
+
+func setCookies(cookies []*http.Cookie) chromedp.Action[chromedp.Void] {
+	return chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+		expr := cdp.TimeSinceEpoch(time.Now().Add(180 * 24 * time.Hour).Unix())
 
 		for _, c := range cookies {
-			err := network.SetCookie(c.Name, c.Value).WithExpires(&expr).WithDomain(geektime.GeekBangCookieDomain).WithHTTPOnly(true).Do(ctx)
+			_, err := cdp.Call(ctx, t, network.SetCookie, network.SetCookieParams{
+				Name:     c.Name,
+				Value:    c.Value,
+				Expires:  expr,
+				Domain:   geektime.GeekBangCookieDomain,
+				HTTPOnly: new(true),
+			})
 			if err != nil {
 				return err
 			}
@@ -146,9 +160,8 @@ func setCookies(cookies []*http.Cookie) chromedp.ActionFunc {
 	})
 }
 
-func hideRedundantElements() chromedp.ActionFunc {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		s := `
+func hideRedundantElements() chromedp.Action[chromedp.Void] {
+	s := `
 			var headMain = document.getElementsByClassName('main')[0];
    			if(headMain){
       				headMain.style.display="none";
@@ -203,59 +216,39 @@ func hideRedundantElements() chromedp.ActionFunc {
 			}
 		`
 
-		_, exp, err := runtime.Evaluate(s).Do(ctx)
-		if err != nil {
-			return err
-		}
-
-		if exp != nil {
-			return exp
-		}
-
-		return nil
-	})
+	return chromedp.Evaluate[chromedp.Void](s)
 }
 
-func hideCommentsBlock() chromedp.ActionFunc {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		hideCommentsExpression := `
+func hideCommentsBlock() chromedp.Action[chromedp.Void] {
+	hideCommentsExpression := `
 			var comments = document.querySelector('div[class^="Index_articleComments"]')
 			if(comments){
 				comments.style.display="none"
 			}
 		`
-		_, exp, err := runtime.Evaluate(hideCommentsExpression).Do(ctx)
-		if err != nil {
-			return err
-		}
-
-		if exp != nil {
-			return exp
-		}
-
-		return nil
-	})
+	return chromedp.Evaluate[chromedp.Void](hideCommentsExpression)
 }
 
-func printToPDF(fileName string) chromedp.ActionFunc {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		_, stream, err := page.PrintToPDF().
-			WithMarginTop(0.4).
-			WithMarginBottom(0.4).
-			WithMarginLeft(0.4).
-			WithMarginRight(0.4).
-			WithTransferMode(page.PrintToPDFTransferModeReturnAsStream).
-			Do(ctx)
+func printToPDF(fileName string) chromedp.Action[chromedp.Void] {
+	return chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+		res, err := cdp.Call(ctx, t, page.PrintToPDF, page.PrintToPDFParams{
+			MarginTop:    new(0.4),
+			MarginBottom: new(0.4),
+			MarginLeft:   new(0.4),
+			MarginRight:  new(0.4),
+			TransferMode: page.PrintToPDFTransferModeReturnAsStream,
+		})
 		if err != nil {
 			return err
 		}
 
 		reader := &streamReader{
-			ctx:    ctx,
-			handle: stream,
-			r:      nil,
-			pos:    0,
-			eof:    false,
+			ctx:     ctx,
+			session: t,
+			handle:  res.Stream,
+			r:       nil,
+			pos:     0,
+			eof:     false,
 		}
 
 		defer func() {
@@ -287,8 +280,8 @@ func printToPDF(fileName string) chromedp.ActionFunc {
 
 // touchScrollAction returns a chromedp.Action that performs repeated touch
 // scroll gestures until commentsDone is set or the action context is canceled.
-func touchScrollAction(commentsDone *uint32) chromedp.Action {
-	return chromedp.ActionFunc(func(ctx context.Context) error {
+func touchScrollAction(commentsDone *uint32) chromedp.Action[chromedp.Void] {
+	return chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
 		for {
 			if atomic.LoadUint32(commentsDone) == 1 {
 				return nil
@@ -301,15 +294,11 @@ func touchScrollAction(commentsDone *uint32) chromedp.Action {
 
 			logger.Infof("Performing touch scroll to load more comments")
 
-			c := chromedp.FromContext(ctx)
+			_, _ = cdp.Call(ctx, t, input.DispatchTouchEvent, input.DispatchTouchEventParams{Type: input.DispatchTouchEventTypeTouchStart, TouchPoints: []*input.TouchPoint{{X: 300, Y: 800}}})
 
-			ec := cdp.WithExecutor(ctx, c.Target)
+			_, _ = cdp.Call(ctx, t, input.DispatchTouchEvent, input.DispatchTouchEventParams{Type: input.DispatchTouchEventTypeTouchMove, TouchPoints: []*input.TouchPoint{{X: 300, Y: 400}}})
 
-			_ = input.DispatchTouchEvent(input.TouchStart, []*input.TouchPoint{{X: 300, Y: 800}}).Do(ec)
-
-			_ = input.DispatchTouchEvent(input.TouchMove, []*input.TouchPoint{{X: 300, Y: 400}}).Do(ec)
-
-			_ = input.DispatchTouchEvent(input.TouchEnd, []*input.TouchPoint{}).Do(ec)
+			_, _ = cdp.Call(ctx, t, input.DispatchTouchEvent, input.DispatchTouchEventParams{Type: input.DispatchTouchEventTypeTouchEnd, TouchPoints: []*input.TouchPoint{}})
 
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -318,22 +307,19 @@ func touchScrollAction(commentsDone *uint32) chromedp.Action {
 
 // fetchAndHandleCommentList fetches the response body for a comment list request
 // and updates commentsDone when there are no more pages. It runs its work in a
-// separate goroutine so callers can call it without blocking the ListenTarget
-// callback.
+// separate goroutine so callers can call it without blocking the event loop.
 func fetchAndHandleCommentList(ctx context.Context, reqID network.RequestID, url string, commentsDone *uint32) {
 	go func() {
 		logger.Infof("Begin fetching comment list: %s", url)
 
-		c := chromedp.FromContext(ctx)
-
-		body, err := network.GetResponseBody(reqID).Do(cdp.WithExecutor(ctx, c.Target))
+		res, err := chromedp.Call(ctx, network.GetResponseBody, network.GetResponseBodyParams{RequestID: reqID})
 		if err != nil {
 			logger.Errorf(err, "Failed to get comment response body")
 			return
 		}
 
 		var commentResp V4CommentListResponse
-		if err := json.Unmarshal(body, &commentResp); err != nil {
+		if err := json.Unmarshal(res.Body, &commentResp); err != nil {
 			logger.Errorf(err, "Failed to unmarshal comment response body")
 			return
 		}

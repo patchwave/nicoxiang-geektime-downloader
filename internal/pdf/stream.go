@@ -3,22 +3,21 @@ package pdf
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"github.com/chromedp/cdproto/cdp"
 	"io"
-	"strings"
 
 	cdprotoio "github.com/chromedp/cdproto/io"
 )
 
 // Credits: https://raw.githubusercontent.com/mafredri/cdp/3c5eab7ffc5cbee667b0a813ce470ac423792811/protocol/io/stream_reader.go.
 type streamReader struct {
-	ctx    context.Context
-	handle cdprotoio.StreamHandle
-	r      io.Reader
-	pos    int
-	eof    bool
+	ctx     context.Context
+	session cdp.Session
+	handle  cdprotoio.StreamHandle
+	r       io.Reader
+	pos     int
+	eof     bool
 }
 
 // Read a chunk of the stream.
@@ -52,30 +51,15 @@ func (reader *streamReader) Read(p []byte) (n int, err error) {
 
 	reader.eof = reply.EOF
 
-	switch {
-	case reply.Base64encoded:
-		b := []byte(reply.Data)
-		size := base64.StdEncoding.DecodedLen(len(b))
-
-		// Safety-check for fast-path to avoid panics.
-		if len(p) >= size {
-			n, err = base64.StdEncoding.Decode(p, b)
-			reader.pos += n
-
-			return n, err
-		}
-
-		reader.r = base64.NewDecoder(base64.StdEncoding, bytes.NewReader(b))
-	default:
-		reader.r = strings.NewReader(reply.Data)
-	}
+	// cdproto decodes base64 data, so reply.Data holds the raw bytes.
+	reader.r = bytes.NewReader(reply.Data)
 
 	return reader.read(p)
 }
 
 // Close closes the stream, discard any temporary backing storage.
 func (reader *streamReader) Close() error {
-	err := cdprotoio.Close(reader.handle).Do(reader.ctx)
+	_, err := cdp.Call(reader.ctx, reader.session, cdprotoio.Close, cdprotoio.CloseParams{Handle: reader.handle})
 	if err == nil {
 		return nil
 	}
@@ -83,14 +67,13 @@ func (reader *streamReader) Close() error {
 	return fmt.Errorf("close Chromium stream: %w", err)
 }
 
-func (reader *streamReader) next(pos, size int) (cdprotoio.ReadReturns, error) {
-	params := cdprotoio.
-		Read(reader.handle).
-		WithOffset(int64(pos)).
-		WithSize(int64(size))
-
-	var res cdprotoio.ReadReturns
-	err := cdp.Execute(reader.ctx, cdprotoio.CommandRead, params, &res)
+func (reader *streamReader) next(pos, size int) (cdprotoio.ReadResult, error) {
+	offset := int64(pos)
+	res, err := cdp.Call(reader.ctx, reader.session, cdprotoio.Read, cdprotoio.ReadParams{
+		Handle: reader.handle,
+		Offset: &offset,
+		Size:   int64(size),
+	})
 
 	if err == nil {
 		return res, nil
